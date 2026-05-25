@@ -1,0 +1,34 @@
+name: Task Tracker Issue Audit Pipeline
+
+on:
+  workflow_dispatch:
+  schedule:
+    # GitHub Actions cron is UTC.
+    # Run at the start of every hour.
+    - cron: "0 * * * *"
+
+jobs:
+  run-pipeline:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Run pipeline
+        env:
+          CLICKUP_API_TOKEN: ${{ secrets.CLICKUP_API_TOKEN }}
+          GOOGLE_SERVICE_ACCOUNT_JSON: ${{ secrets.GOOGLE_SERVICE_ACCOUNT_JSON }}
+          AUDIT_SHEET_URL: ${{ secrets.AUDIT_SHEET_URL }}
+          PROJECT_NAME_FILTER: ${{ secrets.PROJECT_NAME_FILTER }}
+          HIGHLIGHT_TRACKER_ERRORS: ${{ secrets.HIGHLIGHT_TRACKER_ERRORS }}
+          RESOURCE_LOOKUP_TAB: ${{ secrets.RESOURCE_LOOKUP_TAB }}
+        run: python3 task_tracker_issue_audit_pipeline.py
