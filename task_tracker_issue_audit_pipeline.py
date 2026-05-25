@@ -512,6 +512,45 @@ def upload(df, sheet, tab):
         values = clean_df.astype(str).values.tolist()
         ws.update(range_name="A2", values=values)
 
+def is_quota_error(error):
+    """Return True when a Sheets/Drive API error is caused by rate limits."""
+    return "429" in str(error) or "quota exceeded" in str(error).lower()
+
+def open_spreadsheet_by_key_with_retry(client, sheet_id, project_name=""):
+    """Open a spreadsheet with retry and backoff for quota-related failures."""
+    label = project_name or sheet_id
+
+    for attempt in range(5):
+        try:
+            return client.open_by_key(sheet_id)
+        except Exception as e:
+            if not is_quota_error(e):
+                raise
+
+            wait = 5 * (attempt + 1)
+            log(f"⏳ Quota hit opening spreadsheet: {label}, wait {wait}s")
+            time.sleep(wait)
+
+    raise RuntimeError(f"Spreadsheet open quota exceeded: {label}")
+
+def list_worksheets_with_retry(spreadsheet, project_name=""):
+    """List spreadsheet worksheets with retry and backoff for quota errors."""
+    label = project_name or getattr(spreadsheet, "id", "unknown spreadsheet")
+
+    for attempt in range(5):
+        try:
+            time.sleep(READ_DELAY)
+            return spreadsheet.worksheets()
+        except Exception as e:
+            if not is_quota_error(e):
+                raise
+
+            wait = 10 * (attempt + 1)
+            log(f"⏳ Quota hit loading worksheet list: {label}, wait {wait}s")
+            time.sleep(wait)
+
+    raise RuntimeError(f"Worksheet metadata quota exceeded: {label}")
+
 def read_worksheet_values(worksheet, range_name=None, project_name="", sheet_name=""):
     """Read worksheet values with retry and backoff for Sheets API quota errors."""
     label = sheet_name or worksheet.title.strip()
@@ -523,7 +562,7 @@ def read_worksheet_values(worksheet, range_name=None, project_name="", sheet_nam
                 return worksheet.get(range_name)
             return worksheet.get_all_values()
         except gspread.exceptions.APIError as e:
-            if "429" in str(e):
+            if is_quota_error(e):
                 wait = 10 * (attempt + 1)
                 if project_name:
                     log(f"⏳ Quota hit: {project_name} - {label}, wait {wait}s")
@@ -702,7 +741,7 @@ def append_sheet_error_once(error_logs, sheet_name, message, header=None, col_na
 
 def build_tracker_combined_data(spreadsheet, project_name=""):
     """Build the combined tracker data sheet and collect per-sheet issues."""
-    all_sheets = spreadsheet.worksheets()
+    all_sheets = list_worksheets_with_retry(spreadsheet, project_name=project_name)
     combined_data = []
     standard_header = []
     header_added = False
@@ -1656,7 +1695,7 @@ def build_project_summary(tasks, gs_client):
         sheet_id = m.group(1)
         
         try:
-            spreadsheet = gs_client.open_by_key(sheet_id)
+            spreadsheet = open_spreadsheet_by_key_with_retry(gs_client, sheet_id, project_name=project_name)
         except Exception:
             continue
         
@@ -1665,7 +1704,12 @@ def build_project_summary(tasks, gs_client):
         cc_count = 0
         
         # Scan ALL sheets
-        for ws in spreadsheet.worksheets():
+        try:
+            worksheets = list_worksheets_with_retry(spreadsheet, project_name=project_name)
+        except Exception:
+            continue
+
+        for ws in worksheets:
             try:
                 time.sleep(READ_DELAY)
                 values = ws.get("A:Z")
@@ -1763,14 +1807,9 @@ def main():
         sheet_id = m.group(1)
         project_log["tracker_sheet_id"] = sheet_id
 
-        for attempt in range(5):
-            try:
-                spreadsheet = gs_client.open_by_key(sheet_id)
-                break
-            except Exception:
-                wait = 5 * (attempt + 1)
-                time.sleep(wait)
-        else:
+        try:
+            spreadsheet = open_spreadsheet_by_key_with_retry(gs_client, sheet_id, project_name=project_name)
+        except Exception:
             projects_failed.add(project_name)
             log(f"❌ Failed to open tracker for {project_name}")
             project_status_map[project_name] = "SHEET_OPEN_FAILED"
@@ -1819,7 +1858,17 @@ def main():
 
         project_had_data = False
         last_project_issue_reason = ""
-        worksheets = spreadsheet.worksheets()
+        try:
+            worksheets = list_worksheets_with_retry(spreadsheet, project_name=project_name)
+        except Exception:
+            projects_failed.add(project_name)
+            project_status_map[project_name] = "READ_QUOTA_FAILED"
+            project_log["last_issue_reason_code"] = "WORKSHEET_METADATA_QUOTA_EXCEEDED"
+            last_project_issue_reason = "Worksheet metadata could not be loaded because quota retries were exhausted."
+            finalize_project_log(project_log, "READ_QUOTA_FAILED", last_project_issue_reason)
+            log(f"⚠️ Finished {project_name} with status: READ_QUOTA_FAILED")
+            continue
+
         project_log["total_worksheets"] = len(worksheets)
 
         for ws in worksheets:
