@@ -29,6 +29,7 @@ jobs:
           GOOGLE_SERVICE_ACCOUNT_JSON: ${{ secrets.GOOGLE_SERVICE_ACCOUNT_JSON }}
           AUDIT_SHEET_URL: ${{ secrets.AUDIT_SHEET_URL }}
           PROJECT_NAME_FILTER: ${{ secrets.PROJECT_NAME_FILTER }}
+          IGNORE_PDL_EMAILS: ${{ secrets.IGNORE_PDL_EMAILS }}
           HIGHLIGHT_TRACKER_ERRORS: ${{ secrets.HIGHLIGHT_TRACKER_ERRORS }}
           RESOURCE_LOOKUP_TAB: ${{ secrets.RESOURCE_LOOKUP_TAB }}
         run: python3 task_tracker_issue_audit_pipeline.py

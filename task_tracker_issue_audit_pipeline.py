@@ -63,6 +63,8 @@ CLICKUP_API_TOKEN = None
 GOOGLE_SERVICE_ACCOUNT_JSON = None
 AUDIT_SHEET_URL = None
 PROJECT_NAME_FILTER = None
+PROJECT_NAME_FILTERS = []
+IGNORED_DELIVERY_LEAD_EMAILS = set()
 HIGHLIGHT_TRACKER_ERRORS = None
 RESOURCE_LOOKUP_TAB = "Team List & Activity"
 gs_client = None
@@ -99,12 +101,25 @@ def normalize_service_account_json(value):
     except Exception:
         return text
 
+def parse_env_list(value):
+    """Parse a comma- or newline-separated env var into trimmed non-empty values."""
+    if not value:
+        return []
+
+    return [
+        item.strip()
+        for item in re.split(r"[\n,]+", str(value))
+        if item and item.strip()
+    ]
+
 def load_runtime_config():
     """Load required runtime configuration and stop early if anything is missing."""
     global CLICKUP_API_TOKEN
     global GOOGLE_SERVICE_ACCOUNT_JSON
     global AUDIT_SHEET_URL
     global PROJECT_NAME_FILTER
+    global PROJECT_NAME_FILTERS
+    global IGNORED_DELIVERY_LEAD_EMAILS
     global HIGHLIGHT_TRACKER_ERRORS
     global RESOURCE_LOOKUP_TAB
 
@@ -112,6 +127,11 @@ def load_runtime_config():
     GOOGLE_SERVICE_ACCOUNT_JSON = os.getenv("GOOGLE_SERVICE_ACCOUNT_JSON")
     AUDIT_SHEET_URL = os.getenv("AUDIT_SHEET_URL")
     PROJECT_NAME_FILTER = (os.getenv("PROJECT_NAME_FILTER") or "").strip()
+    PROJECT_NAME_FILTERS = parse_env_list(PROJECT_NAME_FILTER)
+    IGNORED_DELIVERY_LEAD_EMAILS = {
+        email.lower()
+        for email in parse_env_list(os.getenv("IGNORE_PDL_EMAILS"))
+    }
     HIGHLIGHT_TRACKER_ERRORS = (os.getenv("HIGHLIGHT_TRACKER_ERRORS", "true") or "true").strip().lower() in {
         "1", "true", "yes", "y"
     }
@@ -139,6 +159,7 @@ def authenticate_google():
     global gs_client
     global audit_sheet
 
+    sa_path = None
     try:
         with NamedTemporaryFile(mode="w+", suffix=".json", delete=False) as f:
             f.write(GOOGLE_SERVICE_ACCOUNT_JSON)
@@ -158,6 +179,13 @@ def authenticate_google():
     except Exception as e:
         log(f"❌ Google authentication failed: {e}")
         sys.exit(1)
+    finally:
+        # Clean up temporary credentials file
+        if sa_path and os.path.exists(sa_path):
+            try:
+                os.remove(sa_path)
+            except Exception as cleanup_error:
+                log(f"⚠️ Failed to clean up temp credentials file: {cleanup_error}")
 
 # ============================================================
 # CLICKUP FETCH
@@ -166,6 +194,8 @@ def authenticate_google():
 LIST_ID = "900201326056"
 TRACKER_FIELD_NAME = "Task/Progress Tracker"
 DATA_QUANTITY_FIELD_NAME = "Data Quantity"
+PDL_EMAIL_FIELD_NAMES = {"PDL Email"}
+PDL_EMAIL_FIELD_IDS = {"2b95d848-3486-4e91-9d41-55de07011be4"}
 
 TARGET_STATUS_NAMES = [
     "project received",
@@ -193,7 +223,7 @@ def fetch_clickup_tasks():
         )
 
         if r.status_code != 200:
-            log(f"❌ ClickUp error: {r.text}")
+            log(f"❌ ClickUp API error: HTTP {r.status_code}")
             sys.exit(1)
 
         batch = r.json().get("tasks", [])
@@ -206,22 +236,104 @@ def fetch_clickup_tasks():
     log(f"✅ Total ClickUp projects (selected status): {len(tasks)}")
     return tasks
 
-def filter_tasks_for_test_run(tasks):
-    """Optionally narrow the task set to one exact project name for test runs."""
-    if not PROJECT_NAME_FILTER:
-        log("ℹ️ PROJECT_NAME_FILTER is empty. Processing all matching ClickUp projects.")
-        return tasks
+def get_custom_field_value(task, field_names=None, field_ids=None, default=""):
+    """Return the first matching ClickUp custom field value by name or id."""
+    field_names = field_names or set()
+    field_ids = field_ids or set()
 
-    filtered_tasks = [
-        task for task in tasks
-        if str(task.get("name", "")).strip().lower() == PROJECT_NAME_FILTER.lower()
-    ]
+    if isinstance(field_names, str):
+        field_names = {field_names}
+    if isinstance(field_ids, str):
+        field_ids = {field_ids}
+
+    normalized_field_names = {str(name).strip().lower() for name in field_names}
+    normalized_field_ids = {str(field_id).strip().lower() for field_id in field_ids}
+
+    for field in task.get("custom_fields", []):
+        field_name = str(field.get("name", "")).strip().lower()
+        field_id = str(field.get("id", "")).strip().lower()
+        if field_name in normalized_field_names or field_id in normalized_field_ids:
+            return field.get("value") or default
+    return default
+
+def extract_email_values(value):
+    """Flatten a ClickUp custom field value into normalized email strings."""
+    if value is None:
+        return set()
+
+    if isinstance(value, str):
+        return {item.strip().lower() for item in parse_env_list(value)}
+
+    if isinstance(value, (list, tuple, set)):
+        emails = set()
+        for item in value:
+            emails.update(extract_email_values(item))
+        return emails
+
+    if isinstance(value, dict):
+        emails = set()
+        for key in ("email", "value", "username", "name"):
+            if key in value:
+                emails.update(extract_email_values(value.get(key)))
+        return emails
+
+    return {str(value).strip().lower()} if str(value).strip() else set()
+
+def get_task_pdl_email_values(task):
+    """Return normalized email values from the task PDL custom field."""
+    return extract_email_values(
+        get_custom_field_value(
+            task,
+            field_names=PDL_EMAIL_FIELD_NAMES,
+            field_ids=PDL_EMAIL_FIELD_IDS,
+            default="",
+        )
+    )
+
+def filter_tasks_for_test_run(tasks):
+    """Optionally skip tasks by project name and ignored PDL email."""
+    filtered_tasks = tasks
+
+    if PROJECT_NAME_FILTERS:
+        ignored_project_names = {name.lower() for name in PROJECT_NAME_FILTERS}
+        filtered_tasks = [
+            task for task in filtered_tasks
+            if str(task.get("name", "")).strip().lower() not in ignored_project_names
+        ]
+        log(
+            f"🔕 PROJECT_NAME_FILTER enabled for {len(PROJECT_NAME_FILTERS)} project name(s) "
+            f"-> remaining {len(filtered_tasks)} project(s) after ignore list"
+        )
+    else:
+        log("ℹ️ PROJECT_NAME_FILTER is empty. Processing all matching ClickUp projects.")
+
+    if not IGNORED_DELIVERY_LEAD_EMAILS:
+        return filtered_tasks
+
+    tasks_after_pdl_filter = []
+    ignored_task_count = 0
+    tasks_with_pdl_value = 0
+
+    for task in filtered_tasks:
+        delivery_lead_email_values = get_task_pdl_email_values(task)
+        if delivery_lead_email_values:
+            tasks_with_pdl_value += 1
+
+        if delivery_lead_email_values.intersection(IGNORED_DELIVERY_LEAD_EMAILS):
+            ignored_task_count += 1
+            continue
+
+        tasks_after_pdl_filter.append(task)
 
     log(
-        f'🔎 PROJECT_NAME_FILTER enabled: "{PROJECT_NAME_FILTER}" '
-        f"-> matched {len(filtered_tasks)} project(s)"
+        f"🔕 IGNORE_PDL_EMAILS enabled for {len(IGNORED_DELIVERY_LEAD_EMAILS)} email(s) "
+        f"-> skipped {ignored_task_count} project(s)"
     )
-    return filtered_tasks
+    log(
+        f"ℹ️ PDL email values found on {tasks_with_pdl_value}/{len(filtered_tasks)} project(s) "
+        f"after project-name filtering"
+    )
+    return tasks_after_pdl_filter
 
 # ============================================================
 # EXTRACTION CONFIG
@@ -1595,6 +1707,13 @@ def convert_to_number_or_blank(value):
 
 def build_stage_count(df, date_col, member_col, out_col):
     """Count unique members working per project and date for one stage."""
+    # Validate required columns exist
+    required_cols = ["project_name", date_col, member_col]
+    for col in required_cols:
+        if col not in df.columns:
+            log(f"⚠️ Missing column '{col}' in stage data")
+            return pd.DataFrame(columns=["project_name", "date", out_col])
+    
     stage = df[["project_name", date_col, member_col]].dropna(subset=[date_col, member_col]).copy()
 
     if stage.empty:
@@ -1615,6 +1734,23 @@ def build_stage_count(df, date_col, member_col, out_col):
 
 def build_member_activity(df, date_col, member_col, work_stage):
     """Build a normalized member activity table for one workflow stage."""
+    # Validate required columns exist
+    required_cols = ["project_name", date_col, member_col]
+    for col in required_cols:
+        if col not in df.columns:
+            log(f"⚠️ Missing column '{col}' in member activity data")
+            return pd.DataFrame(
+                columns=[
+                    "date",
+                    "project_name",
+                    "work_stage",
+                    "qai_id",
+                    "member_name",
+                    "member_name_in_tracker",
+                    "resource_type",
+                ]
+            )
+    
     stage = df[["project_name", date_col, member_col]].dropna(subset=[date_col, member_col]).copy()
 
     if stage.empty:
@@ -1749,7 +1885,12 @@ def main():
     reset_run_state()
 
     tasks = filter_tasks_for_test_run(fetch_clickup_tasks())
-    resource_type_map = load_resource_type_lookup()
+    
+    try:
+        resource_type_map = load_resource_type_lookup()
+    except Exception as e:
+        log(f"⚠️ Failed to load resource type lookup (using defaults): {e}")
+        resource_type_map = {}
 
     total_projects = len(tasks)
     projects_with_tracker = 0
@@ -1774,10 +1915,10 @@ def main():
                 tracker_url = f.get("value")
             if f.get("name") == "Data Type":
                 data_type = f.get("value") or ""
-            if f.get("name") == "Delivery Lead Email":
-                delivery_lead_email = f.get("value") or ""
             if f.get("name") == DATA_QUANTITY_FIELD_NAME:
                 data_quantity = f.get("value") or ""
+
+        delivery_lead_email = ", ".join(sorted(get_task_pdl_email_values(task)))
 
         data_quantity = convert_to_number_or_blank(data_quantity)
         project_data_quantity[project_name] = data_quantity
@@ -2106,5 +2247,13 @@ def main():
     log("===================================")
     log("🎉 PIPELINE COMPLETED SUCCESSFULLY")
 
+
 if __name__ == "__main__":
-    main()
+    try:
+        main()
+    except Exception as e:
+        log(f"❌ Pipeline failed with error: {e}")
+        reset_run_state()
+        sys.exit(1)
+    finally:
+        reset_run_state()

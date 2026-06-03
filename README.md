@@ -26,9 +26,17 @@ Set these locally in `.env` or in GitHub repository secrets:
 
 Optional variables:
 
-- `PROJECT_NAME_FILTER`: If set, only the exact matching project name is processed. Useful for testing.
+- `PROJECT_NAME_FILTER`: Optional ignore list for exact project names. Supports one or many names separated by commas or new lines.
+- `IGNORE_PDL_EMAILS`: Optional list of PDL emails to skip entirely. Supports commas or new lines. The pipeline reads either the `PDL Email` or `Delivery Lead Email` ClickUp custom field.
 - `HIGHLIGHT_TRACKER_ERRORS`: `true` or `false`. Defaults to `true`.
 - `RESOURCE_LOOKUP_TAB`: Optional sheet tab name reserved for future resource-type mapping. Defaults to `Team List & Activity`.
+
+Examples:
+
+```env
+PROJECT_NAME_FILTER=Project Alpha,Project Beta
+IGNORE_PDL_EMAILS=pdl1@example.com,pdl2@example.com
+```
 
 ## Local Run
 
@@ -62,7 +70,8 @@ Add these repository secrets before enabling the scheduled workflow:
 - `CLICKUP_API_TOKEN`
 - `GOOGLE_SERVICE_ACCOUNT_JSON`
 - `AUDIT_SHEET_URL`
-- `PROJECT_NAME_FILTER` if you want test-only runs
+- `PROJECT_NAME_FILTER` if you want to skip one or more exact project names
+- `IGNORE_PDL_EMAILS` if you want to skip one or more Delivery Lead / PDL emails
 - `HIGHLIGHT_TRACKER_ERRORS` if you want to override the default
 - `RESOURCE_LOOKUP_TAB` if you use a non-default lookup tab later
 
