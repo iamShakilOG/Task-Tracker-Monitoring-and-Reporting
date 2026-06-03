@@ -51,7 +51,10 @@ def log(msg):
     """Print a UTC timestamped log line for local runs and GitHub Actions."""
     print(f"[{datetime.now(timezone.utc).isoformat()}] {msg}", flush=True)
 
-READ_DELAY = 1.2  # Prevent quota bursts
+READ_DELAY = 2.0  # Prevent quota bursts (increased)
+WRITE_DELAY = 2.0  # Delay between write operations
+MAX_RETRIES = 15  # Maximum retry attempts for quota errors
+MAX_QUOTA_WAIT = 300  # Maximum total wait time (5 minutes)
 
 # ============================================================
 # ENV VARIABLES
@@ -608,39 +611,75 @@ def finalize_project_log(project_log, status_code, fallback_reason=""):
     project_run_logs.append(project_log)
 
 def upload(df, sheet, tab):
-    """Replace a destination worksheet with the contents of a DataFrame."""
-    try:
-        ws = sheet.worksheet(tab)
-        ws.clear()
-    except Exception:
-        ws = sheet.add_worksheet(title=tab, rows="1000", cols="20")
+    """Replace a destination worksheet with the contents of a DataFrame with retry logic."""
+    total_wait = 0
+    
+    for attempt in range(MAX_RETRIES):
+        try:
+            time.sleep(WRITE_DELAY)
+            try:
+                ws = sheet.worksheet(tab)
+                ws.clear()
+            except Exception:
+                ws = sheet.add_worksheet(title=tab, rows="1000", cols="20")
 
-    ws.update(range_name="A1", values=[df.columns.tolist()])
+            ws.update(range_name="A1", values=[df.columns.tolist()])
 
-    if not df.empty:
-        clean_df = df.copy()
-        clean_df = clean_df.replace([float("inf"), float("-inf")], pd.NA)
-        clean_df = clean_df.where(pd.notna(clean_df), "")
-        values = clean_df.astype(str).values.tolist()
-        ws.update(range_name="A2", values=values)
+            if not df.empty:
+                time.sleep(WRITE_DELAY)
+                clean_df = df.copy()
+                clean_df = clean_df.replace([float("inf"), float("-inf")], pd.NA)
+                clean_df = clean_df.where(pd.notna(clean_df), "")
+                values = clean_df.astype(str).values.tolist()
+                ws.update(range_name="A2", values=values)
+            
+            return  # Success
+        except Exception as e:
+            if is_quota_error(e):
+                wait = exponential_backoff(attempt, base=15, max_wait=120)
+                total_wait += wait
+                
+                if total_wait > MAX_QUOTA_WAIT:
+                    log(f"❌ Max quota wait time ({MAX_QUOTA_WAIT}s) exceeded. Data may be incomplete.")
+                    raise RuntimeError(f"Write quota exceeded for tab: {tab}")
+                
+                log(f"⏳ Quota hit writing to {tab}, wait {wait}s (attempt {attempt+1}/{MAX_RETRIES})")
+                time.sleep(wait)
+            else:
+                raise
+    
+    raise RuntimeError(f"Write quota exceeded for tab: {tab}")
 
 def is_quota_error(error):
     """Return True when a Sheets/Drive API error is caused by rate limits."""
     return "429" in str(error) or "quota exceeded" in str(error).lower()
 
+def exponential_backoff(attempt, base=10, max_wait=60):
+    """Calculate exponential backoff wait time with cap."""
+    wait = base * (2 ** attempt)
+    return min(wait, max_wait)
+
 def open_spreadsheet_by_key_with_retry(client, sheet_id, project_name=""):
     """Open a spreadsheet with retry and backoff for quota-related failures."""
     label = project_name or sheet_id
+    total_wait = 0
 
-    for attempt in range(5):
+    for attempt in range(MAX_RETRIES):
         try:
+            time.sleep(READ_DELAY)
             return client.open_by_key(sheet_id)
         except Exception as e:
             if not is_quota_error(e):
                 raise
 
-            wait = 5 * (attempt + 1)
-            log(f"⏳ Quota hit opening spreadsheet: {label}, wait {wait}s")
+            wait = exponential_backoff(attempt, base=5, max_wait=120)
+            total_wait += wait
+            
+            if total_wait > MAX_QUOTA_WAIT:
+                log(f"❌ Max quota wait time ({MAX_QUOTA_WAIT}s) exceeded for: {label}")
+                raise RuntimeError(f"Spreadsheet open quota exceeded: {label}")
+            
+            log(f"⏳ Quota hit opening spreadsheet: {label}, wait {wait}s (attempt {attempt+1}/{MAX_RETRIES})")
             time.sleep(wait)
 
     raise RuntimeError(f"Spreadsheet open quota exceeded: {label}")
@@ -648,8 +687,9 @@ def open_spreadsheet_by_key_with_retry(client, sheet_id, project_name=""):
 def list_worksheets_with_retry(spreadsheet, project_name=""):
     """List spreadsheet worksheets with retry and backoff for quota errors."""
     label = project_name or getattr(spreadsheet, "id", "unknown spreadsheet")
+    total_wait = 0
 
-    for attempt in range(5):
+    for attempt in range(MAX_RETRIES):
         try:
             time.sleep(READ_DELAY)
             return spreadsheet.worksheets()
@@ -657,8 +697,14 @@ def list_worksheets_with_retry(spreadsheet, project_name=""):
             if not is_quota_error(e):
                 raise
 
-            wait = 10 * (attempt + 1)
-            log(f"⏳ Quota hit loading worksheet list: {label}, wait {wait}s")
+            wait = exponential_backoff(attempt, base=10, max_wait=120)
+            total_wait += wait
+            
+            if total_wait > MAX_QUOTA_WAIT:
+                log(f"❌ Max quota wait time ({MAX_QUOTA_WAIT}s) exceeded for: {label}")
+                raise RuntimeError(f"Worksheet metadata quota exceeded: {label}")
+            
+            log(f"⏳ Quota hit loading worksheet list: {label}, wait {wait}s (attempt {attempt+1}/{MAX_RETRIES})")
             time.sleep(wait)
 
     raise RuntimeError(f"Worksheet metadata quota exceeded: {label}")
@@ -666,8 +712,9 @@ def list_worksheets_with_retry(spreadsheet, project_name=""):
 def read_worksheet_values(worksheet, range_name=None, project_name="", sheet_name=""):
     """Read worksheet values with retry and backoff for Sheets API quota errors."""
     label = sheet_name or worksheet.title.strip()
+    total_wait = 0
 
-    for attempt in range(5):
+    for attempt in range(MAX_RETRIES):
         try:
             time.sleep(READ_DELAY)
             if range_name:
@@ -675,11 +722,17 @@ def read_worksheet_values(worksheet, range_name=None, project_name="", sheet_nam
             return worksheet.get_all_values()
         except gspread.exceptions.APIError as e:
             if is_quota_error(e):
-                wait = 10 * (attempt + 1)
+                wait = exponential_backoff(attempt, base=10, max_wait=120)
+                total_wait += wait
+                
+                if total_wait > MAX_QUOTA_WAIT:
+                    log(f"❌ Max quota wait time ({MAX_QUOTA_WAIT}s) exceeded for: {label}")
+                    raise RuntimeError(f"Read quota exceeded for worksheet: {label}")
+                
                 if project_name:
-                    log(f"⏳ Quota hit: {project_name} - {label}, wait {wait}s")
+                    log(f"⏳ Quota hit: {project_name} - {label}, wait {wait}s (attempt {attempt+1}/{MAX_RETRIES})")
                 else:
-                    log(f"⏳ Quota hit: {label}, wait {wait}s")
+                    log(f"⏳ Quota hit: {label}, wait {wait}s (attempt {attempt+1}/{MAX_RETRIES})")
                 time.sleep(wait)
             else:
                 raise
@@ -2226,12 +2279,35 @@ def main():
         ascending=[True, True],
     ).reset_index(drop=True)
 
-    upload(project_run_log_df, audit_sheet, "Pipeline Execution Logs")
-    upload(pd.DataFrame(tab_audit_logs), audit_sheet, "Project Tracker Audit Log")
-    upload(pd.DataFrame(tracker_format_issue_logs), audit_sheet, "Task Tracker Format Issues")
+    # Write audit data with error handling to prevent data loss
+    audit_writes = [
+        (project_run_log_df, "Pipeline Execution Logs"),
+        (pd.DataFrame(tab_audit_logs), "Project Tracker Audit Log"),
+        (pd.DataFrame(tracker_format_issue_logs), "Task Tracker Format Issues"),
+    ]
+    
+    for df_to_upload, tab_name in audit_writes:
+        try:
+            log(f"📝 Writing audit data to '{tab_name}'...")
+            upload(df_to_upload, audit_sheet, tab_name)
+            log(f"✅ Successfully wrote to '{tab_name}'")
+        except Exception as e:
+            log(f"❌ FAILED to write to {tab_name}: {e}")
+            log(f"⚠️  WARNING: Data for {tab_name} may be incomplete or lost!")
+            # Continue trying to write remaining tabs instead of crashing
+            continue
 
     if not all_dfs:
         log("⚠️ No data extracted.")
+    else:
+        # Save compiled data locally as backup (prevents data loss if final writes fail)
+        try:
+            backup_df = pd.concat(all_dfs, ignore_index=True)
+            backup_file = f"compiled_data_backup_{datetime.now(timezone.utc).strftime('%Y%m%d_%H%M%S')}.csv"
+            backup_df.to_csv(backup_file, index=False)
+            log(f"💾 Backup saved: {backup_file} ({len(backup_df)} rows)")
+        except Exception as e:
+            log(f"⚠️ Failed to save backup: {e}")
 
     log("===================================")
     log("PIPELINE SUMMARY")
