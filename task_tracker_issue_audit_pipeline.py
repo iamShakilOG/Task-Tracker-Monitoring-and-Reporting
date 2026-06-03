@@ -49,12 +49,30 @@ from collections import defaultdict
 
 def log(msg):
     """Print a UTC timestamped log line for local runs and GitHub Actions."""
-    print(f"[{datetime.now(timezone.utc).isoformat()}] {msg}", flush=True)
+    try:
+        # Sanitize message to handle invalid Unicode, including lone surrogates.
+        if isinstance(msg, str):
+            msg = msg.encode("utf-8", errors="backslashreplace").decode("utf-8", errors="replace")
+        timestamp = datetime.now(timezone.utc).isoformat()
+        print(f"[{timestamp}] {msg}", flush=True)
+    except Exception as e:
+        # Fallback if even this fails
+        print(f"[TIMESTAMP] ERROR: Could not log message: {e}", flush=True)
 
 READ_DELAY = 2.0  # Prevent quota bursts (increased)
 WRITE_DELAY = 2.0  # Delay between write operations
 MAX_RETRIES = 15  # Maximum retry attempts for quota errors
 MAX_QUOTA_WAIT = 300  # Maximum total wait time (5 minutes)
+
+def sanitize_utf8(value):
+    """Sanitize a value to ensure valid UTF-8 encoding."""
+    if value is None:
+        return ""
+    try:
+        text = str(value)
+        return text.encode("utf-8", errors="backslashreplace").decode("utf-8", errors="replace")
+    except Exception:
+        return str(value)[:100]  # Return first 100 chars as fallback
 
 # ============================================================
 # ENV VARIABLES
@@ -197,13 +215,12 @@ def authenticate_google():
 LIST_ID = "900201326056"
 TRACKER_FIELD_NAME = "Task/Progress Tracker"
 DATA_QUANTITY_FIELD_NAME = "Data Quantity"
+DELIVERY_LEAD_EMAIL_FIELD_NAMES = {"Delivery Lead Email", "Delivery lead"}
 PDL_EMAIL_FIELD_NAMES = {"PDL Email"}
 PDL_EMAIL_FIELD_IDS = {"2b95d848-3486-4e91-9d41-55de07011be4"}
 
 TARGET_STATUS_NAMES = [
-    "project received",
-    "project in progress",
-    "pending schedule approval",
+    "project in progress"
 ]
 
 def fetch_clickup_tasks():
@@ -292,6 +309,19 @@ def get_task_pdl_email_values(task):
             default="",
         )
     )
+
+def get_task_delivery_lead_email(task):
+    """Return the raw Delivery Lead Email field value for audit/export use."""
+    value = get_custom_field_value(
+        task,
+        field_names=DELIVERY_LEAD_EMAIL_FIELD_NAMES,
+        default="",
+    )
+    if isinstance(value, str):
+        return value.strip()
+
+    email_values = sorted(extract_email_values(value))
+    return ", ".join(email_values)
 
 def filter_tasks_for_test_run(tasks):
     """Optionally skip tasks by project name and ignored PDL email."""
@@ -419,35 +449,36 @@ def normalize_header_row(header):
     return [normalize_header_cell(c) for c in header[:20]]
 
 def validate_tracker_header(header):
-    """Validate the A:T tracker header against the accepted tracker layouts."""
-    actual = normalize_header_row(header)
-    while len(actual) < 20:
-        actual.append("")
-
-    best_match = None
-    best_mismatches = None
-
-    for format_name, expected_cols in ALLOWED_TRACKER_FORMATS.items():
-        expected = [normalize_header_cell(c) for c in expected_cols]
-        mismatches = []
-        for i, expected_value in enumerate(expected):
-            actual_value = actual[i] if i < len(actual) else ""
-            if actual_value != expected_value:
-                mismatches.append({
-                    "column_letter": chr(ord("A") + i),
-                    "column_number": i + 1,
-                    "expected": expected_cols[i],
-                    "actual": header[i] if i < len(header) else "",
-                })
-
-        if not mismatches:
-            return True, format_name, []
-
-        if best_mismatches is None or len(mismatches) < len(best_mismatches):
-            best_match = format_name
-            best_mismatches = mismatches
-
-    return False, best_match, best_mismatches or []
+    """Validate that required columns are present (flexible approach).
+    
+    Instead of strict A:T format matching, check if all required columns exist
+    in the header (case-insensitive, position-independent).
+    Returns: (is_valid, format_name, mismatches)
+    """
+    if not header:
+        return False, "EMPTY_HEADER", []
+    
+    # Normalize header for matching (case-insensitive, extra whitespace removed)
+    normalized_header = {normalize_header_cell(h) for h in header if h}
+    normalized_required = {normalize_header_cell(col) for col in REQUIRED_COLUMNS}
+    
+    missing_columns = normalized_required - normalized_header
+    
+    if not missing_columns:
+        # All required columns found - data is valid
+        return True, "FLEXIBLE_MATCH", []
+    else:
+        # Some required columns missing
+        mismatches = [
+            {
+                "column_letter": "?",
+                "column_number": 0,
+                "expected": col,
+                "actual": "",
+            }
+            for col in sorted(list(missing_columns))[:5]  # Report first 5 missing
+        ]
+        return False, "MISSING_REQUIRED_COLUMNS", mismatches
 
 tracker_format_issue_logs = []
 
@@ -484,6 +515,12 @@ STAGE_REQUIRED_COLUMNS = {
     "CC": ["CC Date", "QAI ID And Cross Checker Name"],
 }
 
+ROW_COMPLETENESS_RULES = {
+    "ANNOTATION_SET": ["Annotation Task Name", "Annotation Date", "QAI ID And Annotator Name"],
+    "QC_SET": ["QC Date", "QAI ID And Reviewer Name", "QC Verdict"],
+    "CC_SET": ["CC Date", "QAI ID And Cross Checker Name", "CC Verdict"],
+}
+
 SKIP_SHEETS = {
     "Dashboard",
     "Project Data Collection",
@@ -501,6 +538,7 @@ QAI_ID_REGEX = re.compile(r"(QAI[\s_-]*[A-Z]{2,}\d+)", re.IGNORECASE)
 TRACKER_COMBINED_SHEET_NAME = "Project Data Collection"
 TRACKER_DASHBOARD_SHEET_NAME = "Dashboard"
 TRACKER_DATEWISE_SUMMARY_SHEET_NAME = "Datewise Summary"
+NO_DATA_FETCHED_REASON = "PROJECT_NOT_STARTED_OR_TRACKER_IS_EMPTY"
 
 tab_audit_logs = []
 project_status_map = {}
@@ -621,17 +659,37 @@ def upload(df, sheet, tab):
                 ws = sheet.worksheet(tab)
                 ws.clear()
             except Exception:
-                ws = sheet.add_worksheet(title=tab, rows="1000", cols="20")
+                try:
+                    ws = sheet.add_worksheet(title=tab, rows="1000", cols="20")
+                except Exception as e:
+                    if "already exists" not in str(e).lower():
+                        raise
+                    ws = sheet.worksheet(tab)
+                    ws.clear()
 
-            ws.update(range_name="A1", values=[df.columns.tolist()])
-
-            if not df.empty:
-                time.sleep(WRITE_DELAY)
+            # Sanitize DataFrame for UTF-8 encoding
+            try:
                 clean_df = df.copy()
+                # Apply UTF-8 sanitization to all object columns
+                for col in clean_df.columns:
+                    if clean_df[col].dtype == 'object':
+                        clean_df[col] = clean_df[col].apply(sanitize_utf8)
+            except Exception as e:
+                log(f"⚠️ Error sanitizing DataFrame for {tab}: {e}")
+                clean_df = df.copy()
+
+            # Sanitize column names
+            safe_columns = [sanitize_utf8(col) for col in clean_df.columns]
+            ws.update(range_name="A1", values=[safe_columns])
+
+            if not clean_df.empty:
+                time.sleep(WRITE_DELAY)
                 clean_df = clean_df.replace([float("inf"), float("-inf")], pd.NA)
                 clean_df = clean_df.where(pd.notna(clean_df), "")
                 values = clean_df.astype(str).values.tolist()
-                ws.update(range_name="A2", values=values)
+                # Final sanitization of all cell values
+                sanitized_values = [[sanitize_utf8(cell) for cell in row] for row in values]
+                ws.update(range_name="A2", values=sanitized_values)
             
             return  # Success
         except Exception as e:
@@ -739,6 +797,98 @@ def read_worksheet_values(worksheet, range_name=None, project_name="", sheet_nam
 
     raise RuntimeError(f"Read quota exceeded for worksheet: {label}")
 
+def read_worksheet_ranges(worksheet, range_names, project_name="", sheet_name=""):
+    """Read multiple worksheet ranges with retry and backoff for quota errors."""
+    label = sheet_name or worksheet.title.strip()
+    total_wait = 0
+
+    for attempt in range(MAX_RETRIES):
+        try:
+            time.sleep(READ_DELAY)
+            return worksheet.batch_get(range_names)
+        except gspread.exceptions.APIError as e:
+            if is_quota_error(e):
+                wait = exponential_backoff(attempt, base=10, max_wait=120)
+                total_wait += wait
+
+                if total_wait > MAX_QUOTA_WAIT:
+                    log(f"❌ Max quota wait time ({MAX_QUOTA_WAIT}s) exceeded for: {label}")
+                    raise RuntimeError(f"Read quota exceeded for worksheet: {label}")
+
+                if project_name:
+                    log(f"⏳ Quota hit: {project_name} - {label}, wait {wait}s (attempt {attempt+1}/{MAX_RETRIES})")
+                else:
+                    log(f"⏳ Quota hit: {label}, wait {wait}s (attempt {attempt+1}/{MAX_RETRIES})")
+                time.sleep(wait)
+            else:
+                raise
+
+    raise RuntimeError(f"Read quota exceeded for worksheet: {label}")
+
+def column_number_to_letter(column_number):
+    """Convert a 1-based column number to an A1 column letter."""
+    letters = []
+    while column_number > 0:
+        column_number, remainder = divmod(column_number - 1, 26)
+        letters.append(chr(65 + remainder))
+    return "".join(reversed(letters))
+
+def read_tracker_required_values(worksheet, project_name="", sheet_name=""):
+    """Read only the required tracker columns, even if they are not contiguous."""
+    header_values = read_worksheet_values(
+        worksheet,
+        range_name="A:T",
+        project_name=project_name,
+        sheet_name=sheet_name,
+    )
+    if not header_values:
+        return [], []
+
+    full_header = [str(h).strip() for h in header_values[0][:20]]
+    available_col_idx = {
+        column_name: full_header.index(column_name)
+        for column_name in REQUIRED_COLUMNS
+        if column_name in full_header
+    }
+
+    column_ranges = []
+    range_to_column_name = []
+    for column_name in REQUIRED_COLUMNS:
+        if column_name not in available_col_idx:
+            continue
+        column_letter = column_number_to_letter(available_col_idx[column_name] + 1)
+        column_ranges.append(f"{column_letter}:{column_letter}")
+        range_to_column_name.append(column_name)
+
+    if not column_ranges:
+        return [REQUIRED_COLUMNS.copy()], full_header
+
+    column_data = read_worksheet_ranges(
+        worksheet,
+        column_ranges,
+        project_name=project_name,
+        sheet_name=sheet_name,
+    )
+
+    column_map = {
+        column_name: values
+        for column_name, values in zip(range_to_column_name, column_data)
+    }
+    total_rows = max((len(values) for values in column_map.values()), default=1)
+
+    projected_values = [REQUIRED_COLUMNS.copy()]
+    for row_index in range(1, total_rows):
+        row = []
+        for column_name in REQUIRED_COLUMNS:
+            values = column_map.get(column_name, [])
+            cell = ""
+            if row_index < len(values) and values[row_index]:
+                cell = values[row_index][0]
+            row.append(cell)
+        projected_values.append(row)
+
+    return projected_values, full_header
+
 def clear_or_create_worksheet(spreadsheet, title, rows=1000, cols=20):
     """Return a cleared worksheet, creating it first when it does not exist."""
     try:
@@ -746,7 +896,17 @@ def clear_or_create_worksheet(spreadsheet, title, rows=1000, cols=20):
         ws.clear()
         return ws
     except Exception:
+        pass
+
+    try:
         return spreadsheet.add_worksheet(title=title, rows=str(rows), cols=str(cols))
+    except Exception as e:
+        if "already exists" not in str(e).lower():
+            raise
+
+    ws = spreadsheet.worksheet(title)
+    ws.clear()
+    return ws
 
 def delete_worksheet_if_exists(spreadsheet, title):
     """Delete a worksheet when present and ignore missing-sheet errors."""
@@ -833,17 +993,18 @@ def remove_duplicate_tracker_rows(rows, header):
 
     return filtered
 
-def extract_valid_tracker_rows_for_merge(values):
+def extract_valid_tracker_rows_for_merge(values, source_header=None):
     """Extract normalized rows from a tracker tab for the combined sheet."""
     if not values or len(values) < 2:
         return None, "EMPTY_TAB", []
 
-    header = [str(h).strip() for h in values[0][:20]]
+    header = [str(h).strip() for h in (source_header or values[0])[:20]]
     is_valid_format, _, _ = validate_tracker_header(header)
     if not is_valid_format:
-        return None, "INVALID_FORMAT", []
+        return None, "INVALID_FORMAT", header
 
-    available_col_idx = {c: header.index(c) for c in REQUIRED_COLUMNS if c in header}
+    projected_header = [str(h).strip() for h in values[0][:20]]
+    available_col_idx = {c: projected_header.index(c) for c in REQUIRED_COLUMNS if c in projected_header}
     supported_stages = [
         stage_name
         for stage_name, stage_cols in STAGE_REQUIRED_COLUMNS.items()
@@ -904,8 +1065,55 @@ def append_sheet_error_once(error_logs, sheet_name, message, header=None, col_na
 
     error_logs.append({"sheet": sheet_name, "cell": cell, "message": message, "count": 1})
 
+def collect_row_completeness_issues(values):
+    """Find rows where a required column set is only partially filled."""
+    if not values or len(values) < 2:
+        return []
+
+    header = [str(h).strip() for h in values[0]]
+    col_idx = {column_name: header.index(column_name) for column_name in header}
+    issues = []
+
+    for issue_name, columns in ROW_COMPLETENESS_RULES.items():
+        if not all(column_name in col_idx for column_name in columns):
+            continue
+
+        bad_rows = []
+        for row_number, row in enumerate(values[1:], start=2):
+            row_values = {
+                column_name: str(row[col_idx[column_name]]).strip()
+                if col_idx[column_name] < len(row) and row[col_idx[column_name]] is not None
+                else ""
+                for column_name in columns
+            }
+            if any(row_values.values()) and not all(row_values.values()):
+                missing_columns = [column_name for column_name, value in row_values.items() if not value]
+                bad_rows.append({
+                    "row_number": row_number,
+                    "missing_columns": missing_columns,
+                })
+
+        if bad_rows:
+            issues.append(
+                {
+                    "issue_name": issue_name,
+                    "columns": columns,
+                    "rows": bad_rows,
+                }
+            )
+
+    return issues
+
 def build_tracker_combined_data(spreadsheet, project_name=""):
-    """Build the combined tracker data sheet and collect per-sheet issues."""
+    """Build the combined tracker data sheet and collect per-sheet issues.
+    
+    OPTIMIZATION (Flexible Column Approach):
+    - Only uses REQUIRED_COLUMNS (9 essential columns) in merged output
+    - Ignores extra/optional columns (Frame Count, Remarks, Error Count, etc.)
+    - Detects required columns from the tracker header, even when columns are not contiguous
+    - Reads only the required columns for row data
+    - Reduces false format errors from shifted layouts
+    """
     all_sheets = list_worksheets_with_retry(spreadsheet, project_name=project_name)
     combined_data = []
     standard_header = []
@@ -920,23 +1128,17 @@ def build_tracker_combined_data(spreadsheet, project_name=""):
         if sheet_name in {TRACKER_COMBINED_SHEET_NAME, TRACKER_DASHBOARD_SHEET_NAME}:
             continue
 
-        values = read_worksheet_values(sheet, project_name=project_name, sheet_name=sheet_name)
+        values, full_header = read_tracker_required_values(sheet, project_name=project_name, sheet_name=sheet_name)
 
-        if values and len(values) > 1:
-            header = [str(v).strip() for v in values[0]]
-
-        if "QAI ID And Annotator Name" in header:
-            annotator_col_idx = header.index("QAI ID And Annotator Name")
-
-            for row in values[1:]:
-                while len(row) <= annotator_col_idx:
-                    row.append("")
-
-                row[annotator_col_idx] = sheet_name
-
-        worksheet_values_map[sheet_name] = values
+        worksheet_values_map[sheet_name] = {
+            "values": values,
+            "source_header": full_header,
+        }
         
-        merge_payload, merge_status, merge_header = extract_valid_tracker_rows_for_merge(values)
+        merge_payload, merge_status, merge_header = extract_valid_tracker_rows_for_merge(
+            values,
+            source_header=full_header,
+        )
         if merge_status != "OK":
             error_logs.append(
                 {
@@ -947,65 +1149,34 @@ def build_tracker_combined_data(spreadsheet, project_name=""):
             )
             continue
 
+        for issue in collect_row_completeness_issues(values):
+            first_row = issue["rows"][0]
+            append_sheet_error_once(
+                error_logs,
+                sheet_name,
+                f'{issue["issue_name"]} incomplete rows (missing: {", ".join(first_row["missing_columns"])})',
+                header=values[0],
+                col_name=first_row["missing_columns"][0] if first_row["missing_columns"] else issue["columns"][0],
+                row_number=first_row["row_number"],
+            )
+
         sheet_header = [str(v).strip() for v in values[0]]
         if not header_added:
-            standard_header = merge_header[:17]
-            if "Annotation Task Name" not in standard_header:
-                standard_header.insert(0, "Annotation Task Name")
+            standard_header = REQUIRED_COLUMNS.copy()
             combined_data.append(standard_header)
             header_added = True
 
         task_name_index = standard_header.index("Annotation Task Name")
         annotator_index = standard_header.index("QAI ID And Annotator Name") if "QAI ID And Annotator Name" in standard_header else -1
 
-        error_track = {}
-
         for row_number, row in enumerate(merge_payload["rows"], start=2):
-            
-            # # quick index map for REQUIRED_COLUMNS (row is aligned to REQUIRED_COLUMNS)
-            col_idx = {name: i for i, name in enumerate(REQUIRED_COLUMNS)}
-            
-            task_val = str(row[col_idx["Annotation Task Name"]]).strip() if col_idx["Annotation Task Name"] < len(row) else ""
-            annot_val = str(row[col_idx["QAI ID And Annotator Name"]]).strip() if col_idx["QAI ID And Annotator Name"] < len(row) else ""
-            ann_date_val = str(row[col_idx["Annotation Date"]]).strip() if col_idx["Annotation Date"] < len(row) else ""
-            reviewer_val = str(row[col_idx["QAI ID And Reviewer Name"]]).strip() if col_idx["QAI ID And Reviewer Name"] < len(row) else ""
-            qc_date_val = str(row[col_idx["QC Date"]]).strip() if col_idx["QC Date"] < len(row) else ""
-            
-            if task_val:
-                if not annot_val:
-                    append_sheet_error_once(
-                        error_logs,
-                        sheet_name,
-                        'Task present but missing "QAI ID And Annotator Name"',
-                        header=merge_payload.get("header"),
-                        col_name="QAI ID And Annotator Name",
-                        row_number=row_number,
-                    )
-                if not ann_date_val:
-                    append_sheet_error_once(
-                        error_logs,
-                        sheet_name,
-                        'Task present but missing "Annotation Date"',
-                        header=merge_payload.get("header"),
-                        col_name="Annotation Date",
-                        row_number=row_number,
-                    )
-            
-            if reviewer_val and not qc_date_val:
-                append_sheet_error_once(
-                    error_logs,
-                    reviewer_val,
-                    'Reviewer present but missing "QC Date"',
-                    header=merge_payload.get("header"),
-                    col_name="QC Date",
-                    row_number=row_number,
-                )
-
             new_row = []
 
             for col_name in standard_header:
                 idx_in_sheet = REQUIRED_COLUMNS.index(col_name) if col_name in REQUIRED_COLUMNS else -1
-                new_row.append(row[idx_in_sheet] if idx_in_sheet != -1 and idx_in_sheet < len(row) else "")
+                cell_value = row[idx_in_sheet] if idx_in_sheet != -1 and idx_in_sheet < len(row) else ""
+                # Sanitize cell value for UTF-8 safety
+                new_row.append(sanitize_utf8(cell_value))
 
             task_name_value = new_row[task_name_index] if task_name_index < len(new_row) else ""
             if not str(task_name_value).strip():
@@ -1047,7 +1218,11 @@ def build_tracker_combined_data(spreadsheet, project_name=""):
     return cleaned_data, error_logs, worksheet_values_map
 
 def build_dashboard_tables(data):
-    """Create annotator and reviewer performance tables from merged tracker data."""
+    """Create annotator and reviewer performance tables from merged tracker data.
+    
+    Operates on data that has been filtered to REQUIRED_COLUMNS only,
+    providing faster dashboard generation and reliable metrics.
+    """
     if not data or len(data) < 2:
         return None
 
@@ -1230,7 +1405,10 @@ def normalize_date_columns(df):
     return df
 
 def build_datewise_summary(combined_data) -> pd.DataFrame:
-    """Build a per-date annotation and review summary table for the tracker."""
+    """Build a per-date annotation and review summary table for the tracker.
+    
+    Uses only REQUIRED_COLUMNS (9 essential columns) for fast processing.
+    """
     cols_out = ["Date", "Annotator", "Task Count", "Reviewer", "Review Task Count"]
 
     if not isinstance(combined_data, list) or len(combined_data) < 2:
@@ -1358,7 +1536,7 @@ def batch_highlight_errors(spreadsheet, error_logs):
             ws.batch_format(requests)
 
         except Exception as e:
-            print(f"Failed formatting {sheet_name}: {e}")
+            log(f"Failed formatting {sheet_name}: {e}")
 
 
 def write_dashboard_error_table(dashboard_ws, spreadsheet, error_logs):
@@ -1971,7 +2149,7 @@ def main():
             if f.get("name") == DATA_QUANTITY_FIELD_NAME:
                 data_quantity = f.get("value") or ""
 
-        delivery_lead_email = ", ".join(sorted(get_task_pdl_email_values(task)))
+        delivery_lead_email = get_task_delivery_lead_email(task)
 
         data_quantity = convert_to_number_or_blank(data_quantity)
         project_data_quantity[project_name] = data_quantity
@@ -2079,10 +2257,18 @@ def main():
 
             project_log["eligible_qai_tabs"] += 1
 
-            values = worksheet_values_map.get(sheet_name)
-            if values is None:
+            worksheet_snapshot = worksheet_values_map.get(sheet_name)
+            if worksheet_snapshot is None:
                 try:
-                    values = read_worksheet_values(ws, range_name="A:T", project_name=project_name, sheet_name=sheet_name)
+                    values, full_header = read_tracker_required_values(
+                        ws,
+                        project_name=project_name,
+                        sheet_name=sheet_name,
+                    )
+                    worksheet_snapshot = {
+                        "values": values,
+                        "source_header": full_header,
+                    }
                 except Exception:
                     projects_failed.add(project_name)
                     project_status_map[project_name] = "READ_QUOTA_FAILED"
@@ -2100,6 +2286,8 @@ def main():
                         data_type,
                     )
                     continue
+            values = worksheet_snapshot.get("values", [])
+            source_header = worksheet_snapshot.get("source_header", values[0] if values else [])
 
             if not values:
                 project_log["tabs_skipped"] += 1
@@ -2125,9 +2313,11 @@ def main():
                 )
                 continue
 
-            header = [str(h).strip() for h in values[0][:20]]
+            header = [str(h).strip() for h in source_header[:20]]
             is_valid_format, matched_format, mismatches = validate_tracker_header(header)
+            
             if is_valid_format:
+                log(f"\u2705 Valid header for {sheet_name} (has all required columns)")
                 log_tracker_format_issue(
                     project_name,
                     tracker_url,
@@ -2139,6 +2329,7 @@ def main():
                     data_type=data_type,
                 )
             else:
+                log(f"\u26a0\ufe0f  {sheet_name} missing some columns: {', '.join(m['expected'] for m in mismatches[:3])}")
                 mismatch_text = "; ".join(
                     f"{m['column_letter']}: expected '{m['expected']}' but found '{m['actual']}'"
                     for m in mismatches
@@ -2147,13 +2338,56 @@ def main():
                     project_name,
                     tracker_url,
                     sheet_name,
-                    "ISSUE_INVALID_A_TO_T_FORMAT",
+                    "ISSUE_INVALID_REQUIRED_COLUMNS",
                     matched_format=matched_format,
                     mismatch_count=len(mismatches),
                     mismatch_details=mismatch_text,
                     actual_header=" | ".join(header),
                     delivery_lead_email=delivery_lead_email,
                     data_type=data_type,
+                )
+                project_log["tabs_skipped"] += 1
+                project_log["last_issue_tab"] = sheet_name
+                project_log["last_issue_reason_code"] = "INVALID_REQUIRED_COLUMNS"
+                last_project_issue_reason = "Eligible QAI tabs were skipped because one or more required headers were missing."
+                log_tab_activity(
+                    project_name,
+                    tracker_url,
+                    sheet_name,
+                    "SKIPPED",
+                    "INVALID_REQUIRED_COLUMNS",
+                    delivery_lead_email,
+                    data_type,
+                    total_rows=max(len(values) - 1, 0),
+                )
+                continue
+
+            for issue in collect_row_completeness_issues(values):
+                sample_rows = ", ".join(str(item["row_number"]) for item in issue["rows"][:10])
+                missing_patterns = "; ".join(
+                    f'row {item["row_number"]}: missing {", ".join(item["missing_columns"])}'
+                    for item in issue["rows"][:5]
+                )
+                log_tracker_format_issue(
+                    project_name,
+                    tracker_url,
+                    sheet_name,
+                    f'ISSUE_{issue["issue_name"]}_INCOMPLETE_ROWS',
+                    mismatch_count=len(issue["rows"]),
+                    mismatch_details=missing_patterns,
+                    actual_header=" | ".join(header),
+                    delivery_lead_email=delivery_lead_email,
+                    data_type=data_type,
+                )
+                log_tab_activity(
+                    project_name,
+                    tracker_url,
+                    sheet_name,
+                    "WARN",
+                    f'{issue["issue_name"]}_INCOMPLETE_ROWS: {len(issue["rows"])} row(s); sample rows: {sample_rows}',
+                    delivery_lead_email,
+                    data_type,
+                    total_rows=max(len(values) - 1, 0),
                 )
 
             if len(values) < 2:
@@ -2172,7 +2406,8 @@ def main():
                 )
                 continue
 
-            available_col_idx = {c: header.index(c) for c in REQUIRED_COLUMNS if c in header}
+            projected_header = [str(h).strip() for h in values[0][:20]]
+            available_col_idx = {c: projected_header.index(c) for c in REQUIRED_COLUMNS if c in projected_header}
             supported_stages = [
                 stage_name
                 for stage_name, stage_cols in STAGE_REQUIRED_COLUMNS.items()
@@ -2236,9 +2471,14 @@ def main():
                 continue
 
             df = pd.DataFrame(rows, columns=REQUIRED_COLUMNS)
-            df["project_name"] = project_name
-            df["Data Type"] = data_type
-            df["Delivery Lead Email"] = delivery_lead_email
+            df["project_name"] = sanitize_utf8(project_name)
+            df["Data Type"] = sanitize_utf8(data_type)
+            df["Delivery Lead Email"] = sanitize_utf8(delivery_lead_email)
+            
+            # Sanitize all string columns in the DataFrame
+            for col in df.columns:
+                if df[col].dtype == 'object':
+                    df[col] = df[col].apply(sanitize_utf8)
 
             all_dfs.append(df)
             project_had_data = True
@@ -2267,6 +2507,28 @@ def main():
                     last_project_issue_reason = "No eligible QAI tabs were found in the tracker."
                 else:
                     last_project_issue_reason = PROJECT_STATUS_REASON_MAP[project_status_map[project_name]]
+            if project_status_map[project_name] == "NO_VALID_ROWS":
+                log_tracker_format_issue(
+                    project_name,
+                    tracker_url,
+                    "PROJECT_LEVEL",
+                    "PROJECT_NOT_STARTED_OR_TRACKER_IS_EMPTY",
+                    mismatch_count=1,
+                    mismatch_details=NO_DATA_FETCHED_REASON,
+                    actual_header="",
+                    delivery_lead_email=delivery_lead_email,
+                    data_type=data_type,
+                )
+                log_tab_activity(
+                    project_name,
+                    tracker_url,
+                    "PROJECT_LEVEL",
+                    "WARN",
+                    NO_DATA_FETCHED_REASON,
+                    delivery_lead_email,
+                    data_type,
+                    total_rows=0,
+                )
             finalize_project_log(project_log, project_status_map[project_name], last_project_issue_reason)
             log(f"⚠️ Finished {project_name} with status: {project_status_map[project_name]}")
         else:
