@@ -220,7 +220,9 @@ PDL_EMAIL_FIELD_NAMES = {"PDL Email"}
 PDL_EMAIL_FIELD_IDS = {"2b95d848-3486-4e91-9d41-55de07011be4"}
 
 TARGET_STATUS_NAMES = [
-    "project in progress"
+    "project in progress",
+    "project received",
+    "pending schedule approval"
 ]
 
 def fetch_clickup_tasks():

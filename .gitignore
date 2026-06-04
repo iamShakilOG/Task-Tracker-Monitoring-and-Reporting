@@ -1,5 +1,5 @@
 .env
 service_account.json
 PRODUCTION_REVIEW.md
-.csv
+*.csv
 __pycache__/
