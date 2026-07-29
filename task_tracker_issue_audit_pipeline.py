@@ -223,6 +223,7 @@ TARGET_STATUS_NAMES = [
     "project in progress",
     "project received",
     "pending schedule approval"
+
 ]
 
 def fetch_clickup_tasks():
@@ -385,6 +386,12 @@ REQUIRED_COLUMNS = [
     "CC Date",
     "QAI ID And Cross Checker Name",
     "CC Verdict",
+]
+
+OPTIONAL_ACCURACY_COLUMNS = [
+    "QC Error Count(Object+Tag)",
+    "CC Error Count(Object+Tag)",
+    "Total Objects",
 ]
 
 # Full A:T tracker formats allowed for every working tracker tab.
@@ -847,15 +854,16 @@ def read_tracker_required_values(worksheet, project_name="", sheet_name=""):
         return [], []
 
     full_header = [str(h).strip() for h in header_values[0][:20]]
+    target_columns = REQUIRED_COLUMNS + OPTIONAL_ACCURACY_COLUMNS
     available_col_idx = {
         column_name: full_header.index(column_name)
-        for column_name in REQUIRED_COLUMNS
+        for column_name in target_columns
         if column_name in full_header
     }
 
     column_ranges = []
     range_to_column_name = []
-    for column_name in REQUIRED_COLUMNS:
+    for column_name in target_columns:
         if column_name not in available_col_idx:
             continue
         column_letter = column_number_to_letter(available_col_idx[column_name] + 1)
@@ -878,10 +886,10 @@ def read_tracker_required_values(worksheet, project_name="", sheet_name=""):
     }
     total_rows = max((len(values) for values in column_map.values()), default=1)
 
-    projected_values = [REQUIRED_COLUMNS.copy()]
+    projected_values = [REQUIRED_COLUMNS.copy() + OPTIONAL_ACCURACY_COLUMNS.copy()]
     for row_index in range(1, total_rows):
         row = []
-        for column_name in REQUIRED_COLUMNS:
+        for column_name in REQUIRED_COLUMNS + OPTIONAL_ACCURACY_COLUMNS:
             values = column_map.get(column_name, [])
             cell = ""
             if row_index < len(values) and values[row_index]:
@@ -1006,7 +1014,8 @@ def extract_valid_tracker_rows_for_merge(values, source_header=None):
         return None, "INVALID_FORMAT", header
 
     projected_header = [str(h).strip() for h in values[0][:20]]
-    available_col_idx = {c: projected_header.index(c) for c in REQUIRED_COLUMNS if c in projected_header}
+    all_columns = REQUIRED_COLUMNS + OPTIONAL_ACCURACY_COLUMNS
+    available_col_idx = {c: projected_header.index(c) for c in all_columns if c in projected_header}
     supported_stages = [
         stage_name
         for stage_name, stage_cols in STAGE_REQUIRED_COLUMNS.items()
@@ -1023,7 +1032,7 @@ def extract_valid_tracker_rows_for_merge(values, source_header=None):
 
         row_values = [
             r[available_col_idx[c]] if c in available_col_idx and available_col_idx[c] < len(r) else ""
-            for c in REQUIRED_COLUMNS
+            for c in all_columns
         ]
 
         has_stage_data = any(
@@ -1163,8 +1172,9 @@ def build_tracker_combined_data(spreadsheet, project_name=""):
             )
 
         sheet_header = [str(v).strip() for v in values[0]]
+        row_column_names = REQUIRED_COLUMNS + OPTIONAL_ACCURACY_COLUMNS
         if not header_added:
-            standard_header = REQUIRED_COLUMNS.copy()
+            standard_header = row_column_names.copy()
             combined_data.append(standard_header)
             header_added = True
 
@@ -1175,7 +1185,7 @@ def build_tracker_combined_data(spreadsheet, project_name=""):
             new_row = []
 
             for col_name in standard_header:
-                idx_in_sheet = REQUIRED_COLUMNS.index(col_name) if col_name in REQUIRED_COLUMNS else -1
+                idx_in_sheet = row_column_names.index(col_name) if col_name in row_column_names else -1
                 cell_value = row[idx_in_sheet] if idx_in_sheet != -1 and idx_in_sheet < len(row) else ""
                 # Sanitize cell value for UTF-8 safety
                 new_row.append(sanitize_utf8(cell_value))
@@ -1240,6 +1250,13 @@ def build_dashboard_tables(data):
     annotator_map = {}
     reviewer_map = {}
 
+    qc_error_index = headers.index("QC Error Count(Object+Tag)") if "QC Error Count(Object+Tag)" in headers else -1
+    cc_error_index = headers.index("CC Error Count(Object+Tag)") if "CC Error Count(Object+Tag)" in headers else -1
+    total_objects_index = headers.index("Total Objects") if "Total Objects" in headers else -1
+
+    overall_total_objects_sum = 0.0
+    overall_total_objects_present = False
+
     for row in data[1:]:
         if not row:
             continue
@@ -1249,44 +1266,129 @@ def build_dashboard_tables(data):
         qc_verdict = str(row[qc_verdict_index] if qc_verdict_index < len(row) else "").strip().lower()
         cc_verdict = str(row[cc_verdict_index] if cc_verdict_index < len(row) else "").strip().lower()
 
+        qc_error_value = convert_to_number_or_blank(row[qc_error_index]) if qc_error_index != -1 and qc_error_index < len(row) else ""
+        cc_error_value = convert_to_number_or_blank(row[cc_error_index]) if cc_error_index != -1 and cc_error_index < len(row) else ""
+        total_objects_value = convert_to_number_or_blank(row[total_objects_index]) if total_objects_index != -1 and total_objects_index < len(row) else ""
+
+        qc_error = float(qc_error_value) if isinstance(qc_error_value, (int, float)) else 0.0
+        cc_error = float(cc_error_value) if isinstance(cc_error_value, (int, float)) else 0.0
+        # Preserve presence of Total Objects: None when missing, numeric when present
+        if isinstance(total_objects_value, (int, float)):
+            total_objects = float(total_objects_value)
+            total_objects_present = True
+        else:
+            total_objects = 0.0
+            total_objects_present = False
+
+        if total_objects_present:
+            overall_total_objects_present = True
+            overall_total_objects_sum += total_objects
+
         if annotator_full:
             annotator_stats = annotator_map.setdefault(
                 annotator_full,
-                {"task_count": 0, "correct": 0, "incorrect": 0},
+                {
+                    "task_count": 0,
+                    "correct": 0,
+                    "incorrect": 0,
+                    "error_count": 0.0,
+                    "total_objects": 0.0,
+                    "total_object_rows": 0,
+                },
             )
             annotator_stats["task_count"] += 1
             if qc_verdict == "correct":
                 annotator_stats["correct"] += 1
             elif qc_verdict == "incorrect":
                 annotator_stats["incorrect"] += 1
+            annotator_stats["error_count"] += qc_error
+            if total_objects_present:
+                annotator_stats["total_objects"] += total_objects
+                annotator_stats["total_object_rows"] += 1
 
         if reviewer_full:
             reviewer_stats = reviewer_map.setdefault(
                 reviewer_full,
-                {"task_count": 0, "correct": 0, "incorrect": 0},
+                {
+                    "task_count": 0,
+                    "correct": 0,
+                    "incorrect": 0,
+                    "error_count": 0.0,
+                    "total_objects": 0.0,
+                    "total_object_rows": 0,
+                },
             )
             reviewer_stats["task_count"] += 1
             if cc_verdict == "correct":
                 reviewer_stats["correct"] += 1
             elif cc_verdict == "incorrect":
                 reviewer_stats["incorrect"] += 1
+            reviewer_stats["error_count"] += cc_error
+            if total_objects_present:
+                reviewer_stats["total_objects"] += total_objects
+                reviewer_stats["total_object_rows"] += 1
 
-    annotator_table = [["Annotator ID", "Name", "Task Count", "Correct", "Incorrect", "Accuracy (%)"]]
-    annotator_totals = {"task_count": 0, "correct": 0, "incorrect": 0}
+    annotator_table = [["Annotator ID", "Name", "Task Count", "Correct", "Incorrect", "Error Count", "Total Objects", "Accuracy (%)"]]
+    annotator_totals = {
+        "task_count": 0,
+        "correct": 0,
+        "incorrect": 0,
+        "error_count": 0.0,
+        "total_objects": 0.0,
+        "total_object_rows": 0,
+    }
+    reviewer_totals = {
+        "task_count": 0,
+        "correct": 0,
+        "incorrect": 0,
+        "error_count": 0.0,
+        "total_objects": 0.0,
+        "total_object_rows": 0,
+    }
+    use_object_accuracy = overall_total_objects_present and overall_total_objects_sum > 0
+    
+    # Initialize flags - will be set to True if object accuracy is actually used
+    annotator_object_accuracy_used = False
+    reviewer_object_accuracy_used = False
 
     for raw_name, stats in sorted(annotator_map.items()):
         member_id, member_name = extract_dashboard_member_parts(raw_name)
         total_reviewed = stats["correct"] + stats["incorrect"]
-        accuracy = round((stats["correct"] / total_reviewed) * 100, 2) if total_reviewed else 0
+        if use_object_accuracy:
+            if stats["total_objects"] > 0:
+                accuracy = round((1 - (stats["error_count"] / stats["total_objects"])) * 100, 2)
+                annotator_object_accuracy_used = True
+            else:
+                accuracy = ""
+        else:
+            accuracy = round((stats["correct"] / total_reviewed) * 100, 2) if total_reviewed else 0
         annotator_table.append(
-            [member_id, member_name, stats["task_count"], stats["correct"], stats["incorrect"], accuracy]
+            [
+                member_id,
+                member_name,
+                stats["task_count"],
+                stats["correct"],
+                stats["incorrect"],
+                stats["error_count"],
+                stats["total_objects"],
+                accuracy,
+            ]
         )
         annotator_totals["task_count"] += stats["task_count"]
         annotator_totals["correct"] += stats["correct"]
         annotator_totals["incorrect"] += stats["incorrect"]
+        annotator_totals["error_count"] += stats["error_count"]
+        annotator_totals["total_objects"] += stats["total_objects"]
 
     annotator_total_reviewed = annotator_totals["correct"] + annotator_totals["incorrect"]
-    annotator_total_accuracy = round((annotator_totals["correct"] / annotator_total_reviewed) * 100, 2) if annotator_total_reviewed else 0
+    if use_object_accuracy:
+        if annotator_totals["total_objects"] > 0:
+            annotator_total_accuracy = round((1 - (annotator_totals["error_count"] / annotator_totals["total_objects"])) * 100, 2)
+            annotator_object_accuracy_used = True
+        else:
+            annotator_total_accuracy = ""
+    else:
+        annotator_total_accuracy = round((annotator_totals["correct"] / annotator_total_reviewed) * 100, 2) if annotator_total_reviewed else 0
     annotator_table.append(
         [
             "Total",
@@ -1294,26 +1396,54 @@ def build_dashboard_tables(data):
             annotator_totals["task_count"],
             annotator_totals["correct"],
             annotator_totals["incorrect"],
+            annotator_totals["error_count"],
+            annotator_totals["total_objects"],
             annotator_total_accuracy,
         ]
     )
 
-    reviewer_table = [["Reviewer ID", "Name", "Task Count", "CC Correct", "CC Incorrect", "Total CC", "Accuracy (%)"]]
-    reviewer_totals = {"task_count": 0, "correct": 0, "incorrect": 0}
+    reviewer_table = [["Reviewer ID", "Name", "Task Count", "CC Correct", "CC Incorrect", "Total CC", "Error Count", "Total Objects", "Accuracy (%)"]]
 
     for raw_name, stats in sorted(reviewer_map.items()):
         member_id, member_name = extract_dashboard_member_parts(raw_name)
         total_cc = stats["correct"] + stats["incorrect"]
-        accuracy = round((stats["correct"] / total_cc) * 100, 2) if total_cc else 0
+        if use_object_accuracy:
+            if stats.get("total_objects", 0) > 0:
+                accuracy = round((1 - (stats.get("error_count", 0) / stats.get("total_objects", 1))) * 100, 2)
+                reviewer_object_accuracy_used = True
+            else:
+                accuracy = ""
+        else:
+            accuracy = round((stats["correct"] / total_cc) * 100, 2) if total_cc else 0
         reviewer_table.append(
-            [member_id, member_name, stats["task_count"], stats["correct"], stats["incorrect"], total_cc, accuracy]
+            [
+                member_id,
+                member_name,
+                stats["task_count"],
+                stats["correct"],
+                stats["incorrect"],
+                total_cc,
+                stats.get("error_count", 0),
+                stats.get("total_objects", 0),
+                accuracy,
+            ]
         )
         reviewer_totals["task_count"] += stats["task_count"]
         reviewer_totals["correct"] += stats["correct"]
         reviewer_totals["incorrect"] += stats["incorrect"]
+        reviewer_totals["error_count"] += stats.get("error_count", 0)
+        reviewer_totals["total_objects"] += stats.get("total_objects", 0)
+        reviewer_totals["total_object_rows"] += stats.get("total_object_rows", 0)
 
     reviewer_total_cc = reviewer_totals["correct"] + reviewer_totals["incorrect"]
-    reviewer_total_accuracy = round((reviewer_totals["correct"] / reviewer_total_cc) * 100, 2) if reviewer_total_cc else 0
+    if use_object_accuracy:
+        if reviewer_totals["total_objects"] > 0:
+            reviewer_total_accuracy = round((1 - (reviewer_totals["error_count"] / reviewer_totals["total_objects"])) * 100, 2)
+            reviewer_object_accuracy_used = True
+        else:
+            reviewer_total_accuracy = ""
+    else:
+        reviewer_total_accuracy = round((reviewer_totals["correct"] / reviewer_total_cc) * 100, 2) if reviewer_total_cc else 0
     reviewer_table.append(
         [
             "Total",
@@ -1322,13 +1452,20 @@ def build_dashboard_tables(data):
             reviewer_totals["correct"],
             reviewer_totals["incorrect"],
             reviewer_total_cc,
+            reviewer_totals["error_count"],
+            reviewer_totals["total_objects"],
             reviewer_total_accuracy,
         ]
     )
 
+    annotator_method = "Object count" if annotator_object_accuracy_used else "task count"
+    reviewer_method = "Object count" if reviewer_object_accuracy_used else "task count"
+
     return {
         "annotator_table": annotator_table,
         "reviewer_table": reviewer_table,
+        "annotator_accuracy_method": annotator_method,
+        "reviewer_accuracy_method": reviewer_method,
     }
 
 def build_dashboard_export_rows(project_name, tracker_url, dashboard_tables):
@@ -1352,7 +1489,9 @@ def build_dashboard_export_rows(project_name, tracker_url, dashboard_tables):
                 "task_count": row[2],
                 "correct": row[3],
                 "incorrect": row[4],
-                "accuracy_pct": row[5],
+                "error_count": row[5],
+                "total_objects": row[6],
+                "accuracy_pct": row[7],
             }
         )
 
@@ -1370,7 +1509,9 @@ def build_dashboard_export_rows(project_name, tracker_url, dashboard_tables):
                 "cc_correct": row[3],
                 "cc_incorrect": row[4],
                 "total_cc": row[5],
-                "accuracy_pct": row[6],
+                "error_count": row[6],
+                "total_objects": row[7],
+                "accuracy_pct": row[8],
             }
         )
 
@@ -1431,6 +1572,8 @@ def build_datewise_summary(combined_data) -> pd.DataFrame:
         "QAI ID And Annotator Name",
         "QC Date",
         "QAI ID And Reviewer Name",
+        "Error Count(Object+Tag)",
+        "Total Objects"
     ]
     for c in required:
         if c not in df.columns:
@@ -1560,20 +1703,57 @@ def write_dashboard_error_table(dashboard_ws, spreadsheet, error_logs):
                 except Exception:
                     pass
 
-        dashboard_ws.update(range_name="R1", values=pivot_data)
-        format_header_row(dashboard_ws, 18, 2)
+        # Desired start column for the error pivot (V = 22)
+        start_col_num = 22
+        width = len(pivot_data[0]) if pivot_data and isinstance(pivot_data[0], list) else 2
+        required_cols = start_col_num + width - 1
+
+        # Ensure the worksheet has enough columns before writing
+        try:
+            current_cols = getattr(dashboard_ws, "col_count", None)
+            if current_cols is None:
+                # Best-effort: try to access row/col metadata
+                current_cols = dashboard_ws.col_count if hasattr(dashboard_ws, "col_count") else 0
+        except Exception:
+            current_cols = 0
+
+        if current_cols < required_cols:
+            try:
+                dashboard_ws.resize(rows=getattr(dashboard_ws, "row_count", 1000) or 1000, cols=required_cols)
+            except Exception as e:
+                log(f"⚠️ Failed to resize dashboard worksheet to {required_cols} cols: {e}")
+
+        start_letter = column_number_to_letter(start_col_num)
+        dashboard_ws.update(range_name=f"{start_letter}1", values=pivot_data)
+        format_header_row(dashboard_ws, start_col_num, width)
 
         if HIGHLIGHT_TRACKER_ERRORS:
             batch_highlight_errors(
                 spreadsheet=spreadsheet,
-                error_logs=error_logs
+                error_logs=error_logs,
             )
     else:
-        dashboard_ws.update(
-            range_name="R1",
-            values=[["Sheet Name & Error Log", "Count"], ["No Errors Found ✅", "0"]],
-        )
-        format_header_row(dashboard_ws, 18, 2)
+        fallback_data = [["Sheet Name & Error Log", "Count"], ["No Errors Found ✅", "0"]]
+        start_col_num = 22
+        width = len(fallback_data[0])
+        required_cols = start_col_num + width - 1
+
+        try:
+            current_cols = getattr(dashboard_ws, "col_count", None)
+            if current_cols is None:
+                current_cols = dashboard_ws.col_count if hasattr(dashboard_ws, "col_count") else 0
+        except Exception:
+            current_cols = 0
+
+        if current_cols < required_cols:
+            try:
+                dashboard_ws.resize(rows=getattr(dashboard_ws, "row_count", 1000) or 1000, cols=required_cols)
+            except Exception as e:
+                log(f"⚠️ Failed to resize dashboard worksheet to {required_cols} cols: {e}")
+
+        start_letter = column_number_to_letter(start_col_num)
+        dashboard_ws.update(range_name=f"{start_letter}1", values=fallback_data)
+        format_header_row(dashboard_ws, start_col_num, width)
 
 def generate_tracker_dashboard(spreadsheet, project_name=""):
     """Generate helper sheets inside a tracker workbook and return summary stats."""
@@ -1606,8 +1786,20 @@ def generate_tracker_dashboard(spreadsheet, project_name=""):
         dashboard_ws.update(range_name="A1", values=annotator_table)
         format_header_row(dashboard_ws, 1, len(annotator_table[0]))
 
-        dashboard_ws.update(range_name="I1", values=reviewer_table)
-        format_header_row(dashboard_ws, 9, len(reviewer_table[0]))
+        dashboard_ws.update(range_name="K1", values=reviewer_table)
+        format_header_row(dashboard_ws, 11, len(reviewer_table[0]))
+
+        annotator_method = dashboard_tables.get("annotator_accuracy_method", "task count")
+        reviewer_method = dashboard_tables.get("reviewer_accuracy_method", "task count")
+        if annotator_method == "Object count":
+            log("Annotator accuracy is calculated by Object count")
+        else:
+            log("Annotator accuracy is calculated by task count")
+
+        if reviewer_method == "Object count":
+            log("Reviewer accuracy is calculated by Object count")
+        else:
+            log("Reviewer accuracy is calculated by task count")
 
     write_dashboard_error_table(dashboard_ws, spreadsheet, error_logs)
 
